@@ -1,0 +1,43 @@
+# Grok Build Connector - Configuration
+
+[proxy]
+# Mode: "none" | "file"
+#   none = koneksi langsung (IP sendiri)
+#   file = load dari proxies.txt (round-robin per akun)
+mode = "none"
+pool_file = "proxies.txt"
+
+[signup]
+# Browser headless (true) atau tampil (false). --headed di CLI menimpa ini.
+headless = true
+
+# Jeda antar akun dalam detik (+ random 0-5s)
+delay = 3
+
+# Maksimal percobaan ulang per akun saat gagal (total percobaan = retry + 1)
+retry = 1
+
+[9router]
+# Base URL dashboard 9router
+base = "http://localhost:20128"
+
+# Hapus koneksi grok-cli yang lastError-nya terisi, lalu keluarkan dari done.txt
+purge_errors = true
+purge_error_provider = "grok-cli"
+
+[grok]
+# Jarak minimal antar poll (detik). Nilai dari server (biasanya 5) dipakai kalau lebih besar.
+poll_interval = 5
+
+# Berapa lama menunggu authorize selesai setelah klik Allow
+poll_timeout = 180
+
+# Berapa akun baru yang dibuat dalam satu run (email-nya digenerate, bukan dari file)
+count = 1
+
+[tempik]
+# Instance Tempik untuk email sekali pakai
+base = "https://tempik.miraclelabs.my.id"
+
+# Berapa lama menunggu email kode verifikasi xAI
+code_timeout = 120
