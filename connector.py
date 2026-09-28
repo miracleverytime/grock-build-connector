@@ -18,6 +18,7 @@ Run:
   python connector.py --headed        # satu akun (config count), browser tampil
   python connector.py 5               # lima akun
   python connector.py --headed 1      # satu akun, browser tampil
+  python connector.py --on-duty       # loop cek + purge koneksi error tiap 10 detik
 """
 
 from __future__ import annotations
@@ -60,6 +61,8 @@ DONE_FILE = DATA_DIR / "done.txt"
 ACCOUNTS_OUT = DATA_DIR / "accounts.jsonl"
 
 PROVIDER = "grok-cli"
+
+ON_DUTY_INTERVAL = 10
 
 DEFAULT_DATA_DIR = Path(__import__("os").environ.get("APPDATA", "")) / "9router"
 
@@ -325,11 +328,16 @@ class XaiSignup:
     def _click(self, page: Page, labels: List[str], timeout: int = 6000) -> str:
         deadline = time.time() + STEP_TIMEOUT_MS / 1000
         while time.time() < deadline:
+            self._dismiss_cookies(page)
             for label in labels:
                 try:
                     el = page.query_selector(f'button:has-text("{label}")')
                     if el and el.is_visible():
-                        el.click(timeout=timeout)
+                        try:
+                            el.click(timeout=timeout)
+                        except Exception:
+                            # Halaman pindah tepat saat diklik: kliknya sudah sampai.
+                            pass
                         return label
                 except Exception:
                     continue
@@ -379,6 +387,8 @@ class XaiSignup:
         page.goto(verify_url or DEVICE_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
         page.wait_for_timeout(1500)
         self._dismiss_cookies(page)
+        # Kotak kode kadang belum ada karena halaman login yang tampil duluan.
+        page.wait_for_selector('input[inputmode="numeric"]', state="visible", timeout=STEP_TIMEOUT_MS)
         self._fill(page, 'input[inputmode="numeric"]', user_code.replace("-", ""))
         page.wait_for_timeout(300)
         self._click(page, ["Continue", "Lanjutkan"])
@@ -405,8 +415,6 @@ class XaiSignup:
         page.wait_for_timeout(2000)
 
     def _complete_profile(self, page: Page, first: str, last: str, password: str) -> None:
-        # Form nama + password. Selector persisnya belum kelihatan tanpa kode email
-        # sungguhan, jadi dicocokkan dari name dan placeholder yang umum.
         first_box = page.wait_for_selector(
             'input[name="firstName"], input[name="first_name"], input[autocomplete="given-name"], '
             'input[placeholder*="First" i]', state="visible", timeout=STEP_TIMEOUT_MS)
@@ -418,15 +426,40 @@ class XaiSignup:
             last_box.fill(last)
         self._fill(page, 'input[type="password"]', password)
         page.wait_for_timeout(300)
-        self._click(page, ["Complete sign up", "Complete signup", "Sign up", "Create account"])
+        self._dismiss_cookies(page)
+        self._click(page, ["Complete sign up", "Complete signup", "Create account"])
+        # Tunggu form hilang. Kalau tombol masih ada (klik tertelan banner), klik lagi.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                still = page.query_selector('button:has-text("Complete sign up")')
+                if not still or not still.is_visible():
+                    break
+                self._dismiss_cookies(page)
+                still.click(timeout=4000)
+            except Exception:
+                break
+            page.wait_for_timeout(1500)
         log("    [4] profil dilengkapi")
 
     def _allow(self, page: Page) -> None:
-        # Setelah profil, xAI menampilkan device code sekali lagi lalu tombol Allow.
-        deadline = time.time() + 40
+        # Setelah profil: kode device sekali lagi, lalu Allow.
+        # Kalau akun sudah jadi dan halaman langsung pindah, itu juga sukses.
+        deadline = time.time() + 50
         continued = False
         while time.time() < deadline:
-            code_box = page.query_selector('input[inputmode="numeric"]')
+            try:
+                url = page.url
+            except Exception:
+                url = ""
+            if "accounts.x.ai" not in url and url.startswith("http"):
+                log("    [6] akun dibuat, halaman berpindah")
+                return
+            try:
+                code_box = page.query_selector('input[inputmode="numeric"]')
+            except Exception:
+                page.wait_for_timeout(700)
+                continue
             if code_box and code_box.is_visible() and not continued:
                 try:
                     self._click(page, ["Continue", "Lanjutkan"])
@@ -436,9 +469,16 @@ class XaiSignup:
                     continue
                 except Exception:
                     pass
-            allow = page.query_selector('button:has-text("Allow"), button:has-text("Izinkan")')
+            try:
+                allow = page.query_selector('button:has-text("Allow"), button:has-text("Izinkan")')
+            except Exception:
+                page.wait_for_timeout(700)
+                continue
             if allow and allow.is_visible():
-                allow.click(timeout=6000)
+                try:
+                    allow.click(timeout=6000)
+                except Exception:
+                    pass
                 log("    [6] Allow diklik")
                 page.wait_for_timeout(2000)
                 return
@@ -498,6 +538,30 @@ def create_one(nr: NineRouterClient, tempik: TempikClient, idx: int, total: int,
     return True
 
 
+def on_duty(nr: NineRouterClient, interval: float = ON_DUTY_INTERVAL,
+            provider: str = PURGE_ERROR_PROVIDER) -> None:
+    """Loop tiap `interval` detik: purge koneksi error (logika sama kayak connector).
+
+    Dipakai: `python connector.py --on-duty`. Berhenti dengan Ctrl+C.
+    """
+    log(f"[on-duty] mulai, cek tiap {interval}s provider={provider} (Ctrl+C untuk berhenti)")
+    while True:
+        try:
+            def _on_removed(conn: Dict) -> None:
+                em = (conn.get("email") or conn.get("name") or "").strip().lower()
+                if em:
+                    unmark_done(DONE_FILE, em)
+
+            removed = nr.purge_error_connections(provider, on_removed=_on_removed)
+            if removed:
+                log(f"[on-duty] purged {removed} koneksi error")
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            log(f"[on-duty] cek gagal: {e}", "ERROR")
+        time.sleep(interval)
+
+
 def main() -> None:
     args = sys.argv[1:]
     global HEADLESS
@@ -525,6 +589,25 @@ def main() -> None:
     except Exception as e:
         log(f"9router tidak terjangkau di {NINEROUTER_BASE}: {e}", "ERROR")
         sys.exit(1)
+
+    if "--on-duty" in args or "on-duty" in args or "onduty" in args:
+        interval = ON_DUTY_INTERVAL
+        for a in args:
+            if a.startswith("--on-duty-interval="):
+                try:
+                    interval = float(a.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif a.startswith("--interval="):
+                try:
+                    interval = float(a.split("=", 1)[1])
+                except ValueError:
+                    pass
+        try:
+            on_duty(nr, interval=interval)
+        except KeyboardInterrupt:
+            log("[on-duty] berhenti")
+        return
 
     if purge:
         def _on_removed(conn: Dict) -> None:
